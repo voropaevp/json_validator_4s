@@ -27,5 +27,6 @@ libraryDependencies += "is.cir" %% "ciris" % "2.0.1"
 libraryDependencies += "org.scalatest" %% "scalatest" % "3.2.9" % "test"
 libraryDependencies += "org.typelevel" %% "cats-effect-testing-scalatest" % "1.1.1" % Test
 
-
+Test / fork := true
+Test / envVars := Map("SCHEMA_DIR" -> "testStore")
 

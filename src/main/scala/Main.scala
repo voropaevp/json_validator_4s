@@ -22,11 +22,13 @@ import cats.implicits._
 
 import java.nio.file.{Files, Path => JavaPath, Paths => JavaPaths}
 
+
 object ValidatorConfig {
+
   final case class Config(
                            host: String,
                            port: Int,
-                           path: Path
+                           path: JavaPath
                          )
 
   private def parsePath(pathStr: String): Either[ConfigError, JavaPath] = Either.catchNonFatal {
@@ -38,17 +40,19 @@ object ValidatorConfig {
       path
     else
       throw new SecurityException(s"[$pathStr] is not writable")
-  }.leftMap(_.getMessage)
-    .leftMap(ConfigError.apply)
+  }.leftMap(ex => ConfigError(ex.getMessage))
 
 
-  implicit val posIntConfigDecoder: ConfigDecoder[String, Path] = ConfigDecoder.identity[String].map(parsePath)
+  implicit val posIntConfigDecoder: ConfigDecoder[String, JavaPath] = ConfigDecoder.identity[String].mapEither(
+    (_, z) => parsePath(z)
+  )
 
   val config: ConfigValue[Effect, Config] =
-    (env("hostname").or(prop("hostname")).default("127.0.0.1").as[String],
-      env("port").or(prop("port")).default("8881").as[Int],
-      env("schemaDir").or(prop("schemaDir")).default("store").as[Path]
+    (env("HOSTNAME").or(prop("hostname")).default("127.0.0.1").as[String],
+      env("PORT").or(prop("port")).default("8881").as[Int],
+      env("SCHEMA_DIR").or(prop("schemaDir")).default("store").as[JavaPath]
       ).parMapN(Config)
+
 
 }
 
@@ -133,65 +137,76 @@ case class JsonValidator[F[_] : Async](validator: ValidatorAlgebra, schemaDir: J
   import org.http4s.circe._
   import java.io._
 
-  def outputStream(f: File): Resource[F, FileOutputStream] =
-
   // CountDownLatch may be required to handle high load
-  def writeFile(id: SchemaId): Resource[F, FileOutputStream] = Resource.make {
+  private def writeFile(id: SchemaId): Resource[F, FileOutputStream] = Resource.make {
     Async[F].delay(new FileOutputStream(schemaDir.resolve(id.toString).toFile))
   } { outStream =>
     Async[F].delay(outStream.close())
   }
 
+  private def readFile(id: SchemaId): Resource[F, FileInputStream] = Resource.make {
+    Async[F].delay(new FileInputStream(schemaDir.resolve(id.toString).toFile))
+  } { inStream =>
+    Async[F].delay(inStream.close())
+  }
+
+
+  case class ReplyOk(action: String, id: SchemaId)
+
+  implicit val ValidatorReplyOkEncoder: Encoder[ReplyOk] = Encoder.forProduct3(
+    "id",
+    "action",
+    "status")(
+    r => (r.id, r.action, "success")
+  )
+
+  case class ReplyError(action: String, id: SchemaId, message: String)
+
+  implicit val ValidatorReplyErrorEncoder: Encoder[ReplyError] = Encoder.forProduct4(
+    "id",
+    "action",
+    "message",
+    "status")(
+    r => (r.id, r.action, r.message, "error")
+  )
+
 
   val routes: HttpRoutes[F] =
     HttpRoutes.of[F] {
-      case req@POST -> Root / "schema" / IntVar(schemaId) => req
-        .asJson
-        .map(_.deepDropNullValues)
-        .flatMap(json =>
-          writeFile(schemaId).use { fStream =>
-            Async[F].delay(fStream.write(json.toString().getBytes("utf-8")))
-          }.as(Ok(
-            json"""{
-                "action": "uploadSchema",
-                "id": $schemaId,
-                "status": "error",
-                "message": "Invalid JSON"
-            }"""))
-        ).recover {
-        case _: MalformedMessageBodyFailure => BadRequest(
-          json"""{
-                "action": "uploadSchema",
-                "id": $schemaId,
-                "status": "error",
-                "message": "Invalid JSON"
-            }""")
+      case req@POST -> Root / "schema" / IntVar(schemaId) =>
+        req
+          .asJson
+          .map(_.deepDropNullValues)
+          .flatMap(json =>
+            writeFile(schemaId).use { out =>
+              Async[F].delay(
+                out.write(json.noSpaces.getBytes("utf-8"))
+              )
+            })
+          .>>(Created(ReplyOk("uploadSchema", schemaId)))
+          .recoverWith {
+            case _: MalformedMessageBodyFailure =>
+              BadRequest(ReplyError("uploadSchema", schemaId, "Invalid JSON"))
+            case _: IOException =>
+              InternalServerError(ReplyError("uploadSchema", schemaId, "Storage error"))
+            case ex: Throwable =>
+              InternalServerError(ReplyError("uploadSchema", schemaId, ex.getMessage))
+          }
 
-
-        case _: IOException => InternalServerError(
-          json"""{
-                "action": "uploadSchema",
-                "id": $schemaId,
-                "status": "error",
-                "message": "Storage Error"
-            }""")
-        case ex: _ => InternalServerError(
-          json"""{
-                "action": "uploadSchema",
-                "id": $schemaId,
-                "status": "error",
-                "message": ${ex.getMessage}
-            }""")
-
-      }
-
-
-        .flatMap(x => Ok(x))
-
-      case GET -> Root / "schema" / IntVar(schemaId)
-      => Ok("ping")
-      case GET -> Root / "validate" / IntVar(schemaId)
-      => Ok("ping")
+      case GET -> Root / "schema" / IntVar(schemaId) =>
+        readFile(schemaId).use(in =>
+          Ok(
+            in.readAllBytes().asJson
+          )
+        ).recoverWith {
+          case _: ParsingFailure =>
+            InternalServerError(ReplyError("getSchema", schemaId, "Invalid JSON"))
+          case _: IOException =>
+            InternalServerError(ReplyError("getSchema", schemaId, "Storage error"))
+          case ex: Throwable =>
+            InternalServerError(ReplyError("getSchema", schemaId, ex.getMessage))
+        }
+      case GET -> Root / "validate" / IntVar(schemaId) => Ok("ping")
 
     }
 }
