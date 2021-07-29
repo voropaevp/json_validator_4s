@@ -1,28 +1,29 @@
-import cats.effect._
-import org.http4s.{HttpRoutes, MalformedMessageBodyFailure, QueryParamDecoder, Request, Response, StaticFile, Status}
-import org.http4s.dsl.io._
-import io.circe.generic.auto._
-import io.circe.literal._
-import org.http4s.implicits._
+import org.http4s.{Headers, HttpRoutes, MalformedMessageBodyFailure, MediaType, Response}
 import org.http4s.blaze.server._
-import io.circe._
-import io.circe.schema.Schema
-import io.circe.schema.ValidationError
-import io.circe.parser._
-import io.circe.syntax._
-import ciris._
-
-import scala.concurrent.ExecutionContext.global
-import fs2._
+import org.http4s.implicits._
+import org.http4s.circe._
+import org.http4s.circe.CirceEntityEncoder._
 import org.http4s.dsl.Http4sDsl
-import cats.data.Validated.Valid
-import cats.syntax._
+import org.http4s.server.middleware.Logger
+import org.http4s.headers.`Content-Type`
+import io.circe._
+import io.circe.parser._
+import io.circe.literal._
+import io.circe.syntax._
+import io.circe.schema.{Schema, ValidationError}
+import ciris._
 import cats.data._
+import cats.data.Validated.Valid
 import cats.implicits._
+import cats.effect._
+import fs2._
 
+import java.io._
 import java.nio.file.{Files, Path => JavaPath, Paths => JavaPaths}
+import scala.concurrent.ExecutionContext.global
 
-
+/** [[ciris]]'s config handling. This is environment based config without the file.
+ */
 object ValidatorConfig {
 
   final case class Config(
@@ -31,7 +32,12 @@ object ValidatorConfig {
                            path: JavaPath
                          )
 
-  private def parsePath(pathStr: String): Either[ConfigError, JavaPath] = Either.catchNonFatal {
+  /** Checks existence and permissions on provides directory. Creates one if doesn't exist.
+   *
+   * @param pathStr path to json schema storage directory
+   * @return Either of `nio.file.Path` or [[ConfigError]]
+   */
+  private def parseCreatePath(pathStr: String): Either[ConfigError, JavaPath] = Either.catchNonFatal {
     val path = JavaPaths.get(pathStr)
     if (Files.notExists(path)) {
       Files.createDirectories(path)
@@ -42,116 +48,46 @@ object ValidatorConfig {
       throw new SecurityException(s"[$pathStr] is not writable")
   }.leftMap(ex => ConfigError(ex.getMessage))
 
+  implicit val posIntConfigDecoder: ConfigDecoder[String, JavaPath] = ConfigDecoder
+    .identity[String]
+    .mapEither((_, z) => parseCreatePath(z))
 
-  implicit val posIntConfigDecoder: ConfigDecoder[String, JavaPath] = ConfigDecoder.identity[String].mapEither(
-    (_, z) => parsePath(z)
-  )
-
-  val config: ConfigValue[Effect, Config] =
-    (env("HOSTNAME").or(prop("hostname")).default("127.0.0.1").as[String],
-      env("PORT").or(prop("port")).default("8881").as[Int],
-      env("SCHEMA_DIR").or(prop("schemaDir")).default("store").as[JavaPath]
+  /** config builder  from environment, then system prop, and finally defaults.
+   */
+  val validatorConfig: ConfigValue[Effect, Config] =
+    (env("HOSTNAME").or(prop("HOSTNAME")).default("127.0.0.1").as[String],
+      env("PORT").or(prop("PORT")).default("8881").as[Int],
+      env("SCHEMA_DIR").or(prop("SCHEMA_DIR")).default("store").as[JavaPath]
       ).parMapN(Config)
-
 
 }
 
 import ValidatorConfig._
 
-object Main extends IOApp {
-  def run(args: List[String]): IO[ExitCode] = {
-    Stream.eval(config.load[IO])
-      .flatMap(JsonValidator.serverStream[IO])
-      .compile.drain.as(ExitCode.Success)
-  }
-}
 
-object types {
+/** Base types for validator application */
+object ValidatorTypes {
   type SchemaId = Int
-  type RawJson = String
-  type ValidatedJson = ValidatedNel[Exception, Json]
+
+  case object StorageError extends Exception("Storage error")
+
+  case object InvalidJsonError extends Exception("Invalid JSON")
+
+  case object UnknownError extends Exception("Unknown error")
 }
 
-import types._
+/** All possible replies, excluding empty one for 404 */
+object ValidatorReplies {
 
-trait StorageAlgebra[F[_], K, V] {
-  def store(k: K, v: V): F[Unit]
-
-  def get(k: K): F[Option[V]]
-}
-
-
-trait ValidatorAlgebra {
-  def validateSchema(schema: Schema, string: String): ValidatedJson
-
-  def validateJson(text: String): ValidatedJson
-
-  def cleanNull(json: Json): Json
-}
-
-case object SchemaNotFoundException extends Exception
-
-case object CirceJsonValidator extends ValidatorAlgebra {
-
-  def validateSchema(schema: Schema, string: String): ValidatedJson =
-    validateJson(string).andThen(json =>
-      schema.validate(json).as(json))
-
-
-  def validateJson(text: String): ValidatedJson = parse(text).toValidatedNel
-
-  def cleanNull(json: Json): Json = json.deepDropNullValues
-
-}
-
-import org.http4s.circe.CirceEntityEncoder._
-
-case class JsonValidator[F[_] : Async](validator: ValidatorAlgebra, schemaDir: JavaPath) extends Http4sDsl[F] {
-
-  implicit val ValidatedJsonEncoder: Encoder[ValidatedJson] = Encoder.instance {
-    case Valid(json) => json
-    case Validated.Invalid(errors) =>
-      json"""{
-      "action": "validateDocument",
-      "id": "config-schema",
-      "status": "error",
-      "message": ${errors.map(_.getMessage).toList.mkString("\n")}
-     }"""
-  }
-
-  implicit val ParsedJsonEncoder: Encoder[Either[ParsingFailure, Unit]] = Encoder.instance {
-    case Right(_) => json"""
-        {
-            "action": "uploadSchema",
-            "status": "success"
-        }
-        """
-    case Left(error) =>
-      json"""{
-      "action": "validateDocument",
-      "status": "error",
-      "message": ${error.message}
-     }"""
-  }
-
-  import org.http4s.circe._
-  import java.io._
-
-  // CountDownLatch may be required to handle high load
-  private def writeFile(id: SchemaId): Resource[F, FileOutputStream] = Resource.make {
-    Async[F].delay(new FileOutputStream(schemaDir.resolve(id.toString).toFile))
-  } { outStream =>
-    Async[F].delay(outStream.close())
-  }
-
-  private def readFile(id: SchemaId): Resource[F, FileInputStream] = Resource.make {
-    Async[F].delay(new FileInputStream(schemaDir.resolve(id.toString).toFile))
-  } { inStream =>
-    Async[F].delay(inStream.close())
-  }
-
+  import ValidatorTypes._
 
   case class ReplyOk(action: String, id: SchemaId)
+
+  case class ReplyError(action: String, id: SchemaId, error: Exception)
+
+  case class ReplyErrors(action: String, id: SchemaId, errors: NonEmptyList[ValidationError])
+
+  implicit val ValidationErrorEncoder: Encoder[ValidationError] = Encoder.encodeString.contramap[ValidationError](_.getMessage)
 
   implicit val ValidatorReplyOkEncoder: Encoder[ReplyOk] = Encoder.forProduct3(
     "id",
@@ -160,15 +96,91 @@ case class JsonValidator[F[_] : Async](validator: ValidatorAlgebra, schemaDir: J
     r => (r.id, r.action, "success")
   )
 
-  case class ReplyError(action: String, id: SchemaId, message: String)
-
   implicit val ValidatorReplyErrorEncoder: Encoder[ReplyError] = Encoder.forProduct4(
     "id",
     "action",
     "message",
     "status")(
-    r => (r.id, r.action, r.message, "error")
+    r => (r.id, r.action, r.error.getMessage, "error")
   )
+
+  implicit val ValidatorReplyErrorsEncoder: Encoder[ReplyErrors] = Encoder.forProduct4(
+    "id",
+    "action",
+    "message",
+    "status")(
+    r => (r.id, r.action, r.errors.asJson, "error")
+  )
+}
+
+/** Central class for the application.
+ *
+ * @param schemaDir base directory for json schema storage
+ *
+ *                  Read the tests for detailed spec.
+ *
+ *                  For brevity Validator and Storage features have not been abstracted into separate algebras/implementations.
+ *
+ */
+case class JsonValidator[F[_] : Async](schemaDir: JavaPath) extends Http4sDsl[F] {
+
+  import ValidatorTypes._
+  import ValidatorReplies._
+
+
+  /** Reads circe's json from file
+   *
+   * CountDownLatch may be required to handle high load
+   *
+   * @param schemaId Unique id
+   * @return Resource with [[Json]], that clear down open file handles
+   *
+   *         For something more complicated both [[readJson]] and [[writeJson]] should be abstracted into algebra/implementaion
+   */
+  private def readJson(schemaId: SchemaId): Resource[F, Json] =
+    Resource.make {
+      Async[F].delay(new FileInputStream(schemaDir.resolve(schemaId.toString).toFile))
+    } { inStream =>
+      Async[F].delay(inStream.close())
+    }
+      .map(out => new String(out.readAllBytes()))
+      .map(parse)
+      .map(_.toTry.get)
+
+
+  /** Write circe's json from file
+   *
+   * CountDownLatch may be required to handle high load. Or Redis/Memcached even better.
+   *
+   * @param schemaId Unique id
+   * @param json     circe's [[Json]]
+   * @return Resource with [[Unit]], that clear down open file handles
+   */
+  private def writeJson(json: Json, schemaId: SchemaId): Resource[F, Unit] =
+    Resource.make {
+      Async[F].delay(new FileOutputStream(schemaDir.resolve(schemaId.toString).toFile))
+    } { outStream =>
+      Async[F].delay(outStream.close())
+    }
+      .map(_.write(json.noSpaces.getBytes("utf-8")))
+
+
+  /** Intercepts all [[Throwable]] at the route edge
+   *
+   * @param serviceName base part of uri "schema" or "validate"
+   * @param schemaId    id of resource.
+   * @return Partial function that can be used as argument to handleWith
+   */
+  def recoverWithValidator(serviceName: String, schemaId: SchemaId): PartialFunction[Throwable, F[Response[F]]] = {
+    case _: MalformedMessageBodyFailure =>
+      BadRequest(ReplyError(serviceName, schemaId, InvalidJsonError))
+    case _: ParsingFailure =>
+      BadRequest(ReplyError(serviceName, schemaId, InvalidJsonError))
+    case _: IOException =>
+      InternalServerError(ReplyError(serviceName, schemaId, StorageError))
+    case _: Throwable =>
+      InternalServerError(ReplyError(serviceName, schemaId, UnknownError))
+  }
 
 
   val routes: HttpRoutes[F] =
@@ -177,47 +189,70 @@ case class JsonValidator[F[_] : Async](validator: ValidatorAlgebra, schemaDir: J
         req
           .asJson
           .map(_.deepDropNullValues)
-          .flatMap(json =>
-            writeFile(schemaId).use { out =>
-              Async[F].delay(
-                out.write(json.noSpaces.getBytes("utf-8"))
-              )
-            })
+          .map(j => {
+            Schema.load(j)
+            j
+          })
+          .flatMap(json => writeJson(json, schemaId).use_)
           .>>(Created(ReplyOk("uploadSchema", schemaId)))
-          .recoverWith {
-            case _: MalformedMessageBodyFailure =>
-              BadRequest(ReplyError("uploadSchema", schemaId, "Invalid JSON"))
-            case _: IOException =>
-              InternalServerError(ReplyError("uploadSchema", schemaId, "Storage error"))
-            case ex: Throwable =>
-              InternalServerError(ReplyError("uploadSchema", schemaId, ex.getMessage))
-          }
+          .recoverWith(recoverWithValidator("uploadSchema", schemaId))
 
       case GET -> Root / "schema" / IntVar(schemaId) =>
-        readFile(schemaId).use(in =>
-          Ok(
-            in.readAllBytes().asJson
-          )
-        ).recoverWith {
-          case _: ParsingFailure =>
-            InternalServerError(ReplyError("getSchema", schemaId, "Invalid JSON"))
-          case _: IOException =>
-            InternalServerError(ReplyError("getSchema", schemaId, "Storage error"))
-          case ex: Throwable =>
-            InternalServerError(ReplyError("getSchema", schemaId, ex.getMessage))
-        }
-      case GET -> Root / "validate" / IntVar(schemaId) => Ok("ping")
+        readJson(schemaId)
+          .use(schema => Ok.apply(schema))
+          .recoverWith {
+            case _: ParsingFailure =>
+              InternalServerError(ReplyError("getSchema", schemaId, InvalidJsonError))
+          }
+          .recoverWith(recoverWithValidator("uploadSchema", schemaId))
 
+      // schema cache would improve performance, but compromise consistency with filesystem
+      case req@POST -> Root / "validate" / IntVar(schemaId) =>
+        readJson(schemaId).use(schema =>
+          req.asJson
+            .map(_.deepDropNullValues)
+            .map { subject =>
+              Schema
+                .load(schema)
+                .validate(subject)
+            }
+        ).flatMap {
+          case Valid(_) => Ok(ReplyOk("validateDocument", schemaId))
+          case Validated.Invalid(errors) => BadRequest(ReplyErrors("validateDocument", schemaId, errors))
+        }.recoverWith(recoverWithValidator("validateDocument", schemaId))
+      case _ => Sync[F].pure {
+        Response[F](
+          NotFound,
+          body = Stream(
+            """
+               {
+                "status" : "error",
+                "message": "Not found"
+              }
+              """.stripMargin).through(text.utf8Encode),
+          headers = Headers(`Content-Type`(MediaType.application.json) :: Nil)
+        )
+      }
     }
 }
 
 
 object JsonValidator {
-
   def serverStream[F[_] : Async](cfg: Config): Stream[F, ExitCode] =
     BlazeServerBuilder[F](global)
       .bindHttp(cfg.port, cfg.host)
-      .withHttpApp(JsonValidator(CirceJsonValidator, cfg.path).routes.orNotFound)
+      .withHttpApp(Logger.httpApp(logHeaders = true, logBody = true)(JsonValidator(cfg.path)
+        .routes
+        .orNotFound
+      ))
       .serve
 
+}
+
+object Main extends IOApp {
+  def run(args: List[String]): IO[ExitCode] = {
+    Stream.eval(validatorConfig.load[IO])
+      .flatMap(JsonValidator.serverStream[IO])
+      .compile.drain.as(ExitCode.Success)
+  }
 }
