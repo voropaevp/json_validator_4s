@@ -76,7 +76,7 @@ object ValidatorTypes {
   case object UnknownError extends Exception("Unknown error")
 }
 
-/** All possible replies, excluding empty one for 404 */
+/** All possible replies, excluding the one for 404. Since 404 can't be created from case class.  */
 object ValidatorReplies {
 
   import ValidatorTypes._
@@ -117,9 +117,9 @@ object ValidatorReplies {
  *
  * @param schemaDir base directory for json schema storage
  *
- *                  Read the tests for detailed spec.
+ *  See the tests for the detailed spec.
  *
- *                  For brevity Validator and Storage features have not been abstracted into separate algebras/implementations.
+ *  For brevity Validator and Storage features have not been abstracted into separate algebras/implementations.
  *
  */
 case class JsonValidator[F[_] : Async](schemaDir: JavaPath) extends Http4sDsl[F] {
@@ -135,7 +135,7 @@ case class JsonValidator[F[_] : Async](schemaDir: JavaPath) extends Http4sDsl[F]
    * @param schemaId Unique id
    * @return Resource with [[Json]], that clear down open file handles
    *
-   *         For something more complicated both [[readJson]] and [[writeJson]] should be abstracted into algebra/implementaion
+   * For something more complicated both [[readJson]] and [[writeJson]] should be abstracted into algebra/implementaion
    */
   private def readJson(schemaId: SchemaId): Resource[F, Json] =
     Resource.make {
